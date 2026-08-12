@@ -1,0 +1,467 @@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\DB;
+use RuntimeException;
+use Throwable;
+
+/**
+ * Membangun koneksi SQL Server (source) & PostgreSQL (target) secara dinamis
+ * dari kredensial yang dikirim lewat UI (bukan dari .env), lalu menyediakan
+ * introspeksi tabel dan proses copy data generik (tidak hardcode nama tabel).
+ */
+class DynamicDatabaseMigrator
+{
+    protected const SOURCE_CONNECTION = 'ui_sqlsrv_dynamic';
+
+    protected const TARGET_CONNECTION = 'ui_pgsql_dynamic';
+
+    protected const MAINTENANCE_CONNECTION = 'ui_pgsql_maintenance';
+
+    public function __construct(protected array $source, protected array $target)
+    {
+        config([
+            'database.connections.'.self::SOURCE_CONNECTION => [
+                'driver' => 'sqlsrv',
+                'host' => $source['host'],
+                'port' => $source['port'],
+                'database' => $source['database'],
+                'username' => $source['username'],
+                'password' => $source['password'] ?? '',
+                'charset' => 'utf8',
+                'trust_server_certificate' => 'true',
+                'encrypt' => 'yes',
+            ],
+            'database.connections.'.self::TARGET_CONNECTION => [
+                'driver' => 'pgsql',
+                'host' => $target['host'],
+                'port' => $target['port'],
+                'database' => $target['database'],
+                'username' => $target['username'],
+                'password' => $target['password'] ?? '',
+                'charset' => 'utf8',
+                'search_path' => ($target['schema'] ?? 'public').',public',
+                'sslmode' => 'prefer',
+            ],
+        ]);
+
+        DB::purge(self::SOURCE_CONNECTION);
+        DB::purge(self::TARGET_CONNECTION);
+    }
+
+    public function testSource(): void
+    {
+        DB::connection(self::SOURCE_CONNECTION)->getPdo();
+    }
+
+    public function testTarget(): void
+    {
+        DB::connection(self::TARGET_CONNECTION)->getPdo();
+    }
+
+    /**
+     * Daftar tabel di schema source beserta estimasi jumlah baris (cepat,
+     * pakai sys.partitions supaya tidak full-scan tabel besar).
+     */
+    public function listSourceTables(string $schema): array
+    {
+        $rows = DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+            SELECT s.name AS schema_name, t.name AS table_name, SUM(p.rows) AS row_count
+            FROM sys.tables t
+            JOIN sys.schemas s ON t.schema_id = s.schema_id
+            JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+            WHERE s.name = ?
+            GROUP BY s.name, t.name
+            ORDER BY t.name
+        SQL, [$schema]);
+
+        return array_map(fn ($row) => [
+            'name' => $row->table_name,
+            'row_count' => (int) $row->row_count,
+        ], $rows);
+    }
+
+    /**
+     * Copy seluruh baris satu tabel dari source ke target. Kolom ditentukan
+     * dari INFORMATION_SCHEMA source, jadi tidak perlu tahu struktur tabel
+     * di muka. Kolom bertipe `bit` dicast ke boolean untuk Postgres.
+     */
+    public function migrateTable(
+        string $sourceSchema,
+        string $table,
+        string $targetSchema,
+        bool $truncate,
+        int $chunkSize = 1000
+    ): array {
+        $columns = DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+            SELECT COLUMN_NAME, DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            ORDER BY ORDINAL_POSITION
+        SQL, [$sourceSchema, $table]);
+
+        if (empty($columns)) {
+            throw new RuntimeException("Tabel {$sourceSchema}.{$table} tidak ditemukan di source.");
+        }
+
+        $columnNames = array_map(fn ($c) => $c->COLUMN_NAME, $columns);
+        $boolColumns = array_map(
+            fn ($c) => $c->COLUMN_NAME,
+            array_filter($columns, fn ($c) => $c->DATA_TYPE === 'bit')
+        );
+        $orderColumn = $columnNames[0];
+
+        $targetTable = "{$targetSchema}.{$table}";
+
+        if ($truncate) {
+            DB::connection(self::TARGET_CONNECTION)->statement(
+                "TRUNCATE TABLE \"{$targetSchema}\".\"{$table}\" CASCADE"
+            );
+        }
+
+        $migrated = 0;
+
+        DB::connection(self::SOURCE_CONNECTION)
+            ->table("{$sourceSchema}.{$table}")
+            ->orderBy($orderColumn)
+            ->chunk($chunkSize, function ($rows) use (&$migrated, $columnNames, $boolColumns, $targetTable) {
+                $payload = [];
+
+                foreach ($rows as $row) {
+                    $row = (array) $row;
+                    $data = [];
+
+                    foreach ($columnNames as $column) {
+                        $value = $row[$column] ?? null;
+
+                        if ($value !== null && in_array($column, $boolColumns, true)) {
+                            $value = (bool) $value;
+                        }
+
+                        $data[$column] = $value;
+                    }
+
+                    $payload[] = $data;
+                }
+
+                DB::connection(self::TARGET_CONNECTION)->table($targetTable)->insert($payload);
+
+                $migrated += count($payload);
+            });
+
+        $this->resetIdentityIfNeeded($targetSchema, $table);
+
+        return ['table' => $table, 'rows_migrated' => $migrated];
+    }
+
+    /**
+     * Insert manual dengan Id eksplisit ke kolom GENERATED BY DEFAULT AS IDENTITY
+     * tidak memajukan sequence Postgres, jadi disamakan ke MAX(Id) setelahnya.
+     */
+    protected function resetIdentityIfNeeded(string $schema, string $table): void
+    {
+        try {
+            $identityColumn = DB::connection(self::TARGET_CONNECTION)->selectOne(<<<'SQL'
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = ? AND table_name = ? AND is_identity = 'YES'
+                LIMIT 1
+            SQL, [$schema, $table]);
+        } catch (Throwable) {
+            return;
+        }
+
+        if (! $identityColumn) {
+            return;
+        }
+
+        $column = $identityColumn->column_name;
+
+        DB::connection(self::TARGET_CONNECTION)->statement(<<<SQL
+            SELECT setval(
+                pg_get_serial_sequence('"{$schema}"."{$table}"', '{$column}'),
+                COALESCE((SELECT MAX("{$column}") FROM "{$schema}"."{$table}"), 1),
+                true
+            )
+        SQL);
+    }
+
+    /**
+     * Buat database target kalau belum ada. Karena database-nya sendiri belum
+     * tentu ada, koneksi ini terpisah dari TARGET_CONNECTION — nyambung ke
+     * database "postgres" bawaan (maintenance DB) memakai host/kredensial target.
+     */
+    public function createDatabaseIfMissing(): array
+    {
+        config([
+            'database.connections.'.self::MAINTENANCE_CONNECTION => [
+                'driver' => 'pgsql',
+                'host' => $this->target['host'],
+                'port' => $this->target['port'],
+                'database' => 'postgres',
+                'username' => $this->target['username'],
+                'password' => $this->target['password'] ?? '',
+                'charset' => 'utf8',
+                'sslmode' => 'prefer',
+            ],
+        ]);
+        DB::purge(self::MAINTENANCE_CONNECTION);
+
+        $exists = DB::connection(self::MAINTENANCE_CONNECTION)->selectOne(
+            'SELECT 1 AS found FROM pg_database WHERE datname = ?',
+            [$this->target['database']]
+        );
+
+        if ($exists) {
+            return ['created' => false, 'message' => "Database \"{$this->target['database']}\" sudah ada."];
+        }
+
+        $quoted = '"'.str_replace('"', '""', $this->target['database']).'"';
+        DB::connection(self::MAINTENANCE_CONNECTION)->statement("CREATE DATABASE {$quoted}");
+
+        return ['created' => true, 'message' => "Database \"{$this->target['database']}\" berhasil dibuat."];
+    }
+
+    /**
+     * Introspeksi tabel-tabel source lalu jalankan CREATE SCHEMA/CREATE TABLE
+     * yang setara di target. Idempotent (IF NOT EXISTS) — tidak akan menimpa
+     * atau menghapus tabel yang sudah ada beserta isinya.
+     */
+    public function createSchema(string $sourceSchema, array $tables, string $targetSchema): array
+    {
+        DB::connection(self::TARGET_CONNECTION)->statement(
+            "CREATE SCHEMA IF NOT EXISTS \"{$targetSchema}\""
+        );
+
+        $results = [];
+
+        foreach ($tables as $table) {
+            $sql = null;
+
+            try {
+                $columns = DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+                    SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH,
+                           NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_DEFAULT
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                    ORDER BY ORDINAL_POSITION
+                SQL, [$sourceSchema, $table]);
+
+                if (empty($columns)) {
+                    throw new RuntimeException('Tabel tidak ditemukan di source.');
+                }
+
+                $identityColumns = array_map(
+                    fn ($r) => $r->COLUMN_NAME,
+                    DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+                        SELECT c.name AS COLUMN_NAME
+                        FROM sys.columns c
+                        JOIN sys.tables t ON c.object_id = t.object_id
+                        JOIN sys.schemas s ON t.schema_id = s.schema_id
+                        WHERE s.name = ? AND t.name = ? AND c.is_identity = 1
+                    SQL, [$sourceSchema, $table])
+                );
+
+                $pkColumns = array_map(
+                    fn ($r) => $r->COLUMN_NAME,
+                    DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+                        SELECT kcu.COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+                        JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                            ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+                            AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+                        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                            AND tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ?
+                        ORDER BY kcu.ORDINAL_POSITION
+                    SQL, [$sourceSchema, $table])
+                );
+
+                $sql = $this->buildCreateTableSql($targetSchema, $table, $columns, $identityColumns, $pkColumns);
+
+                DB::connection(self::TARGET_CONNECTION)->statement($sql);
+
+                $results[] = ['table' => $table, 'status' => 'success', 'sql' => $sql];
+            } catch (Throwable $e) {
+                $results[] = [
+                    'table' => $table,
+                    'status' => 'error',
+                    'message' => $e->getMessage(),
+                    'sql' => $sql,
+                ];
+            }
+        }
+
+        return $results;
+    }
+
+    /**
+     * Stored procedure T-SQL tidak bisa diterjemahkan otomatis ke PL/pgSQL
+     * (sintaks & semantik jauh berbeda), jadi cuma dideteksi & dilaporkan
+     * supaya user tahu perlu migrasi manual — tidak dieksekusi apapun.
+     */
+    public function listStoredProcedures(string $schema): array
+    {
+        try {
+            $rows = DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+                SELECT ROUTINE_NAME
+                FROM INFORMATION_SCHEMA.ROUTINES
+                WHERE ROUTINE_TYPE = 'PROCEDURE' AND ROUTINE_SCHEMA = ?
+                ORDER BY ROUTINE_NAME
+            SQL, [$schema]);
+        } catch (Throwable) {
+            return [];
+        }
+
+        return array_map(fn ($r) => $r->ROUTINE_NAME, $rows);
+    }
+
+    protected function buildCreateTableSql(
+        string $schema,
+        string $table,
+        array $columns,
+        array $identityColumns,
+        array $pkColumns
+    ): string {
+        $lines = [];
+
+        foreach ($columns as $column) {
+            $pgType = $this->mapSqlServerType(
+                $column->DATA_TYPE,
+                $column->CHARACTER_MAXIMUM_LENGTH,
+                $column->NUMERIC_PRECISION,
+                $column->NUMERIC_SCALE
+            );
+
+            $isIdentity = in_array($column->COLUMN_NAME, $identityColumns, true);
+            $default = $this->translateDefault($column->COLUMN_DEFAULT, $pgType);
+
+            $line = "    \"{$column->COLUMN_NAME}\" {$pgType}";
+
+            if ($isIdentity) {
+                $line .= ' GENERATED BY DEFAULT AS IDENTITY';
+            }
+
+            if ($column->IS_NULLABLE === 'NO') {
+                $line .= ' NOT NULL';
+            }
+
+            if (! $isIdentity && $default !== null) {
+                $line .= " DEFAULT {$default}";
+            }
+
+            $lines[] = $line;
+        }
+
+        if (! empty($pkColumns)) {
+            $quoted = implode(', ', array_map(fn ($c) => "\"{$c}\"", $pkColumns));
+            $lines[] = "    CONSTRAINT \"PK_{$table}\" PRIMARY KEY ({$quoted})";
+        }
+
+        $body = implode(",\n", $lines);
+
+        return "CREATE TABLE IF NOT EXISTS \"{$schema}\".\"{$table}\" (\n{$body}\n);";
+    }
+
+    protected function mapSqlServerType(string $dataType, ?int $maxLength, ?int $precision, ?int $scale): string
+    {
+        return match ($dataType) {
+            'bit' => 'boolean',
+            'tinyint', 'smallint' => 'smallint',
+            'int' => 'integer',
+            'bigint' => 'bigint',
+            'decimal', 'numeric' => "numeric({$precision},{$scale})",
+            'money' => 'numeric(19,4)',
+            'smallmoney' => 'numeric(10,4)',
+            'float' => 'double precision',
+            'real' => 'real',
+            'char', 'nchar' => $maxLength && $maxLength > 0 ? "char({$maxLength})" : 'char(1)',
+            'varchar', 'nvarchar' => $maxLength === -1 || $maxLength === null ? 'text' : "varchar({$maxLength})",
+            'text', 'ntext' => 'text',
+            'date' => 'date',
+            'datetime', 'datetime2', 'smalldatetime' => 'timestamp',
+            'datetimeoffset' => 'timestamptz',
+            'time' => 'time',
+            'uniqueidentifier' => 'uuid',
+            'varbinary', 'binary', 'image' => 'bytea',
+            'xml' => 'xml',
+            default => 'text',
+        };
+    }
+
+    /**
+     * Hanya menerjemahkan default literal (angka/string/0-1 bit). Default
+     * berupa ekspresi/fungsi T-SQL (GETDATE(), NEWID(), dst) dilewati —
+     * lebih aman tidak ada default daripada default yang salah semantik.
+     */
+    protected function translateDefault(?string $sqlServerDefault, string $pgType): ?string
+    {
+        if ($sqlServerDefault === null) {
+            return null;
+        }
+
+        $value = trim($sqlServerDefault);
+
+        while (str_starts_with($value, '(') && str_ends_with($value, ')')) {
+            $value = trim(substr($value, 1, -1));
+        }
+
+        if (preg_match('/^-?\d+(\.\d+)?$/', $value)) {
+            if ($pgType === 'boolean') {
+                return $value === '0' ? 'false' : 'true';
+            }
+
+            return $value;
+        }
+
+        if (preg_match("/^N?'(.*)'$/s", $value, $matches)) {
+            return "'".str_replace("'", "''", $matches[1])."'";
+        }
+
+        return null;
+    }
+
+    /**
+     * Daftar tabel di schema target beserta jumlah baris — dipakai untuk
+     * panel Truncate Table.
+     */
+    public function listTargetTables(string $schema): array
+    {
+        $rows = DB::connection(self::TARGET_CONNECTION)->select(<<<'SQL'
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = ? AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+        SQL, [$schema]);
+
+        return array_map(function ($row) use ($schema) {
+            try {
+                $count = DB::connection(self::TARGET_CONNECTION)
+                    ->table("{$schema}.{$row->table_name}")
+                    ->count();
+            } catch (Throwable) {
+                $count = null;
+            }
+
+            return ['name' => $row->table_name, 'row_count' => $count];
+        }, $rows);
+    }
+
+    public function truncateTables(string $schema, array $tables): array
+    {
+        $results = [];
+
+        foreach ($tables as $table) {
+            try {
+                DB::connection(self::TARGET_CONNECTION)->statement(
+                    "TRUNCATE TABLE \"{$schema}\".\"{$table}\" CASCADE"
+                );
+                $results[] = ['table' => $table, 'status' => 'success'];
+            } catch (Throwable $e) {
+                $results[] = ['table' => $table, 'status' => 'error', 'message' => $e->getMessage()];
+            }
+        }
+
+        return $results;
+    }
+}

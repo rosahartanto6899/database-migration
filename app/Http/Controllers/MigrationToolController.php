@@ -10,6 +10,15 @@ use Throwable;
 
 class MigrationToolController extends Controller
 {
+    public function __construct()
+    {
+        // Kontrol utama proses panjang sekarang tombol "Stop Proses" di UI (lihat
+        // migrate-chunk: tiap request cuma proses 1 chunk kecil, jadi user bisa
+        // berhenti kapan saja di antara chunk). Ini cuma jaring pengaman terakhir
+        // kalau ada request tunggal yang macet (bukan batas utama lagi).
+        set_time_limit(600);
+    }
+
     public function index()
     {
         return view('migration.index', [
@@ -36,6 +45,7 @@ class MigrationToolController extends Controller
 
     public function testConnection(Request $request): JsonResponse
     {
+
         $data = $this->validateCredentials($request);
 
         $migrator = new DynamicDatabaseMigrator($data['source'], $data['target']);
@@ -151,8 +161,6 @@ class MigrationToolController extends Controller
             'truncate' => 'boolean',
         ]);
 
-        set_time_limit(300);
-
         $migrator = new DynamicDatabaseMigrator($data['source'], $data['target']);
 
         $results = [];
@@ -181,6 +189,40 @@ class MigrationToolController extends Controller
         }
 
         return response()->json(['results' => $results]);
+    }
+
+    /**
+     * Migrasi satu potongan tabel (dipanggil berulang oleh JS, offset naik
+     * tiap panggilan) supaya UI bisa nampilin progres per baris dan tiap
+     * request tetap singkat, bukan satu request raksasa untuk 1 tabel penuh.
+     */
+    public function migrateChunk(Request $request): JsonResponse
+    {
+        $data = $this->validateCredentials($request);
+
+        $validated = $request->validate([
+            'table' => 'required|string',
+            'offset' => 'required|integer|min:0',
+            'chunk_size' => 'required|integer|min:1|max:5000',
+            'truncate' => 'boolean',
+        ]);
+
+        $migrator = new DynamicDatabaseMigrator($data['source'], $data['target']);
+
+        try {
+            $result = $migrator->migrateChunk(
+                $data['source']['schema'],
+                $validated['table'],
+                $data['target']['schema'],
+                $validated['offset'],
+                $validated['chunk_size'],
+                (bool) ($validated['truncate'] ?? false)
+            );
+
+            return response()->json($result);
+        } catch (Throwable $e) {
+            return response()->json(['message' => $this->cleanErrorMessage($e)], 422);
+        }
     }
 
     protected function validateCredentials(Request $request): array

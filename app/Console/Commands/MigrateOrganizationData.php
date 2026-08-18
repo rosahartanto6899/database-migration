@@ -121,7 +121,7 @@ class MigrateOrganizationData extends Command
                 "TRUNCATE TABLE \"{$this->schema}\".\"{$table}\"{$identitySuffix} CASCADE"
             );
         }
-
+        
         $bar = $this->output->createProgressBar($total);
         $bar->start();
 
@@ -151,6 +151,8 @@ class MigrateOrganizationData extends Command
 
                     $payload[] = $data;
                 }
+
+                dd($payload);
 
                 DB::connection($this->targetConnection)->table($targetTable)->insert($payload);
 

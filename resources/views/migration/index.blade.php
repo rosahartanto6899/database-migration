@@ -156,6 +156,7 @@
 
         .toolbar { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; font-size: 0.85rem; flex-wrap: wrap; }
         .toolbar label { margin: 0; display: flex; align-items: center; gap: 6px; font-weight: 400; }
+        .table-count-total { color: var(--text-muted); font-weight: 400; }
         .empty-hint { color: var(--text-muted); font-size: 0.85rem; padding: 16px; text-align: center; }
         .alert { padding: 10px 14px; border-radius: 8px; font-size: 0.85rem; margin-bottom: 14px; }
         .alert.error { background: var(--err-bg); color: var(--err); }
@@ -343,13 +344,14 @@
             <p class="panel-desc">Membuat schema + tabel di target berdasarkan struktur kolom tabel source (tipe data diterjemahkan otomatis, kolom IDENTITY & primary key ikut dibuat). Bersifat aman/idempotent — pakai <code>CREATE TABLE IF NOT EXISTS</code>, tidak akan menghapus tabel/data yang sudah ada. Default kolom berupa ekspresi T-SQL (mis. GETDATE()) dilewati, perlu ditambahkan manual.</p>
             <div id="schemaAlertBox"></div>
             <div class="toolbar">
-                <label><input type="checkbox" id="chkAllSchema"> Pilih semua</label>
+                <label><input type="checkbox" id="chkAllSchema"> Pilih semua <span id="totalCountSchema" class="table-count-total"></span></label>
             </div>
             <div class="table-list" id="tableListSchema">
                 <div class="empty-hint">Klik "Muat Daftar Tabel Source" dulu.</div>
             </div>
             <div class="actions">
                 <button type="button" class="primary" id="btnCreateSchema" disabled>Buat Schema &amp; Tabel</button>
+                <button type="button" class="danger" id="btnStopSchema" style="display:none;">Stop Proses</button>
                 <span id="schemaSummary" style="font-size:0.85rem;color:var(--text-muted);"></span>
             </div>
             <div id="procedureBox"></div>
@@ -366,13 +368,14 @@
             <p class="panel-desc">Mengosongkan tabel terpilih di database <strong>target</strong> (PostgreSQL). Tindakan ini menghapus seluruh isi tabel — pastikan tabel yang dicentang memang benar.</p>
             <div id="truncateAlertBox"></div>
             <div class="toolbar">
-                <label><input type="checkbox" id="chkAllTruncate"> Pilih semua</label>
+                <label><input type="checkbox" id="chkAllTruncate"> Pilih semua <span id="totalCountTruncate" class="table-count-total"></span></label>
             </div>
             <div class="table-list" id="tableListTruncate">
                 <div class="empty-hint">Klik "Muat Daftar Tabel Target" dulu.</div>
             </div>
             <div class="actions">
                 <button type="button" class="primary" id="btnTruncate" disabled>Truncate Tabel Terpilih</button>
+                <button type="button" class="danger" id="btnStopTruncate" style="display:none;">Stop Proses</button>
                 <span id="truncateSummary" style="font-size:0.85rem;color:var(--text-muted);"></span>
             </div>
         </section>
@@ -388,7 +391,7 @@
             <p class="panel-desc">Menyalin data dari tabel source terpilih ke tabel target dengan nama yang sama (tabel tujuan harus sudah ada — lihat tab Create Schema).</p>
             <div id="migrateAlertBox"></div>
             <div class="toolbar">
-                <label><input type="checkbox" id="chkAllMigrate"> Pilih semua</label>
+                <label><input type="checkbox" id="chkAllMigrate"> Pilih semua <span id="totalCountMigrate" class="table-count-total"></span></label>
                 <label><input type="checkbox" id="chkTruncate" checked> Kosongkan tabel tujuan sebelum migrasi</label>
             </div>
             <div class="table-list" id="tableListMigrate">
@@ -396,6 +399,7 @@
             </div>
             <div class="actions">
                 <button type="button" class="primary" id="btnMigrate" disabled>Mulai Migrasi</button>
+                <button type="button" class="danger" id="btnStopMigrate" style="display:none;">Stop Proses</button>
                 <span id="migrateSummary" style="font-size:0.85rem;color:var(--text-muted);"></span>
             </div>
         </section>
@@ -407,6 +411,18 @@ const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
 const $ = (id) => document.getElementById(id);
 const state = { sourceTables: null, targetTables: null };
 
+// Tiap tab proses panjang (Create Schema/Truncate/Migration) punya "run state"
+// sendiri-sendiri, supaya tombol Stop di satu tab tidak ikut membatalkan
+// proses tabel di tab lain kalau kebetulan dijalankan bersamaan.
+function createRunState() {
+    return { stopped: false, controller: null };
+}
+
+function stopRun(runState) {
+    runState.stopped = true;
+    runState.controller?.abort();
+}
+
 const routes = {
     testConnection: '{{ route('migration.test-connection') }}',
     createDatabase: '{{ route('migration.create-database') }}',
@@ -414,6 +430,7 @@ const routes = {
     targetTables: '{{ route('migration.target-tables') }}',
     truncate: '{{ route('migration.truncate') }}',
     migrate: '{{ route('migration.migrate') }}',
+    migrateChunk: '{{ route('migration.migrate-chunk') }}',
 };
 
 function credentials() {
@@ -441,7 +458,7 @@ function showAlert(boxId, message, type = 'error') {
     $(boxId).innerHTML = message ? `<div class="alert ${type}">${message}</div>` : '';
 }
 
-async function postJson(url, payload) {
+async function postJson(url, payload, signal) {
     const res = await fetch(url, {
         method: 'POST',
         headers: {
@@ -450,6 +467,7 @@ async function postJson(url, payload) {
             'X-CSRF-TOKEN': csrfToken,
         },
         body: JSON.stringify(payload),
+        signal,
     });
 
     const body = await res.json().catch(() => ({}));
@@ -581,8 +599,12 @@ $('btnCreateDb').addEventListener('click', async () => {
 });
 
 // ---------- Shared: generic checklist renderer ----------
-function renderCheckList(containerId, chkClass, tables, extraColumnFn) {
+function renderCheckList(containerId, chkClass, tables, extraColumnFn, countElId) {
     const list = $(containerId);
+
+    if (countElId && $(countElId)) {
+        $(countElId).textContent = `(${tables.length} tabel)`;
+    }
 
     if (!tables.length) {
         list.innerHTML = '<div class="empty-hint">Tidak ada tabel ditemukan.</div>';
@@ -611,6 +633,69 @@ function bindRowCheckboxes(containerId, chkClass, onChange) {
     onChange();
 }
 
+/**
+ * Proses tabel satu-per-satu (bukan sekaligus dalam satu request), supaya
+ * label "Sedang diproses…" cuma nyala di tabel yang lagi jalan, dan tiap
+ * tabel dapat durasi eksekusinya sendiri. Dicek juga runState.stopped di
+ * setiap giliran — begitu tombol "Stop Proses" diklik, tabel yang belum
+ * kebagian giliran langsung ditandai "Dibatalkan" tanpa dikirim requestnya.
+ *
+ * processFn(table, rowWrapEl) harus resolve ke { ok: bool, text?: string, message?: string }.
+ */
+async function processTablesSequentially(selected, listContainerId, summaryElId, processFn, runState) {
+    let success = 0, failed = 0, cancelled = 0;
+
+    for (const table of selected) {
+        const rowWrap = document.querySelector(`#${listContainerId} .table-row[data-table="${CSS.escape(table)}"]`);
+        const resultEl = rowWrap.querySelector('.result');
+
+        if (runState.stopped) {
+            resultEl.textContent = 'Dibatalkan';
+            resultEl.className = 'result skip';
+            cancelled++;
+            continue;
+        }
+
+        resultEl.textContent = 'Sedang diproses…';
+        resultEl.className = 'result pending';
+
+        if (summaryElId) {
+            $(summaryElId).textContent = `Memproses "${table}"… (${success + failed}/${selected.length} selesai)`;
+        }
+
+        const start = performance.now();
+
+        let outcome;
+        try {
+            outcome = await processFn(table, rowWrap);
+        } catch (err) {
+            outcome = err.name === 'AbortError'
+                ? { ok: false, stopped: true }
+                : { ok: false, message: err.message };
+        }
+
+        const duration = ((performance.now() - start) / 1000).toFixed(1);
+
+        if (outcome.ok) {
+            resultEl.textContent = `${outcome.text} (${duration}s) ✓`;
+            resultEl.className = 'result success';
+            success++;
+        } else if (outcome.stopped) {
+            resultEl.textContent = outcome.text ? `${outcome.text} (dihentikan)` : 'Dihentikan';
+            resultEl.className = 'result skip';
+            cancelled++;
+        } else {
+            // outcome.text (kalau ada) = progres yang sempat kepenuhi sebelum gagal, mis. "3200 / 10000 baris"
+            resultEl.textContent = outcome.text ? `${outcome.text} (${duration}s) ✗` : 'Gagal';
+            resultEl.className = 'result error';
+            resultEl.title = outcome.message || '';
+            failed++;
+        }
+    }
+
+    return { success, failed, cancelled };
+}
+
 // ---------- Tab 3: Create Schema ----------
 async function loadTablesForSchema() {
     const btn = $('btnLoadTablesSchema');
@@ -622,7 +707,7 @@ async function loadTablesForSchema() {
         if (!state.sourceTables) {
             await runTestConnection();
         }
-        renderCheckList('tableListSchema', 'chk-schema', state.sourceTables || [], t => `${t.row_count.toLocaleString('id-ID')} baris`);
+        renderCheckList('tableListSchema', 'chk-schema', state.sourceTables || [], t => `${t.row_count.toLocaleString('id-ID')} baris`, 'totalCountSchema');
         bindRowCheckboxes('tableListSchema', 'chk-schema', updateSchemaButtonState);
     } catch (err) {
         showAlert('schemaAlertBox', err.message, 'error');
@@ -644,37 +729,28 @@ $('btnCreateSchema').addEventListener('click', async () => {
     if (!selected.length) return;
 
     const btn = $('btnCreateSchema');
+    const stopBtn = $('btnStopSchema');
     btn.disabled = true;
     btn.textContent = 'Membuat…';
+    stopBtn.style.display = '';
     showAlert('schemaAlertBox', '');
     $('procedureBox').innerHTML = '';
     $('schemaSummary').textContent = '';
 
-    selected.forEach(name => {
-        const row = document.querySelector(`#tableListSchema .table-row[data-table="${CSS.escape(name)}"] .result`);
-        row.textContent = 'Diproses…';
-        row.className = 'result pending';
-    });
+    let procedures = [];
+    const runState = createRunState();
+    runState.controller = new AbortController();
+    const onStop = () => stopRun(runState);
+    stopBtn.addEventListener('click', onStop);
 
     try {
-        const payload = { ...credentials(), tables: selected };
-        const { results, stored_procedures } = await postJson(routes.createSchema, payload);
+        const { success, failed, cancelled } = await processTablesSequentially(selected, 'tableListSchema', 'schemaSummary', async (table, rowWrap) => {
+            const payload = { ...credentials(), tables: [table] };
+            const { results, stored_procedures } = await postJson(routes.createSchema, payload, runState.controller.signal);
+            const r = results[0];
 
-        let success = 0, failed = 0;
-
-        results.forEach(r => {
-            const rowWrap = document.querySelector(`#tableListSchema .table-row[data-table="${CSS.escape(r.table)}"]`);
-            const row = rowWrap.querySelector('.result');
-
-            if (r.status === 'success') {
-                row.textContent = 'Berhasil ✓';
-                row.className = 'result success';
-                success++;
-            } else {
-                row.textContent = 'Gagal';
-                row.className = 'result error';
-                row.title = r.message;
-                failed++;
+            if (stored_procedures && stored_procedures.length) {
+                procedures = stored_procedures;
             }
 
             if (r.sql) {
@@ -684,21 +760,27 @@ $('btnCreateSchema').addEventListener('click', async () => {
                 details.innerHTML = `<summary>Lihat DDL</summary><pre class="sql">${r.sql.replace(/</g, '&lt;')}</pre>`;
                 rowWrap.appendChild(details);
             }
-        });
 
-        $('schemaSummary').textContent = `${success} tabel berhasil${failed ? `, ${failed} gagal` : ''}.`;
+            return r.status === 'success'
+                ? { ok: true, text: 'Berhasil' }
+                : { ok: false, message: r.message };
+        }, runState);
 
-        if (stored_procedures && stored_procedures.length) {
+        $('schemaSummary').textContent = `${success} tabel berhasil${failed ? `, ${failed} gagal` : ''}${cancelled ? `, ${cancelled} dibatalkan` : ''}.`;
+
+        if (procedures.length) {
             $('procedureBox').innerHTML = `
                 <div class="alert warn">
-                    Ditemukan ${stored_procedures.length} stored procedure di source. T-SQL tidak bisa diterjemahkan otomatis
+                    Ditemukan ${procedures.length} stored procedure di source. T-SQL tidak bisa diterjemahkan otomatis
                     ke PL/pgSQL — perlu ditulis ulang manual di PostgreSQL.
-                    <ul class="proc-list">${stored_procedures.map(p => `<li>${p}</li>`).join('')}</ul>
+                    <ul class="proc-list">${procedures.map(p => `<li>${p}</li>`).join('')}</ul>
                 </div>`;
         }
     } catch (err) {
         showAlert('schemaAlertBox', err.message, 'error');
     } finally {
+        stopBtn.removeEventListener('click', onStop);
+        stopBtn.style.display = 'none';
         btn.disabled = false;
         btn.textContent = 'Buat Schema & Tabel';
     }
@@ -714,7 +796,7 @@ async function loadTablesForTruncate() {
     try {
         const { tables } = await postJson(routes.targetTables, credentials());
         state.targetTables = tables;
-        renderCheckList('tableListTruncate', 'chk-truncate', tables, t => t.row_count === null ? '' : `${t.row_count.toLocaleString('id-ID')} baris`);
+        renderCheckList('tableListTruncate', 'chk-truncate', tables, t => t.row_count === null ? '' : `${t.row_count.toLocaleString('id-ID')} baris`, 'totalCountTruncate');
         bindRowCheckboxes('tableListTruncate', 'chk-truncate', updateTruncateButtonState);
     } catch (err) {
         showAlert('truncateAlertBox', err.message, 'error');
@@ -743,42 +825,38 @@ $('btnTruncate').addEventListener('click', async () => {
     if (!confirmed) return;
 
     const btn = $('btnTruncate');
+    const stopBtn = $('btnStopTruncate');
     btn.disabled = true;
     btn.textContent = 'Menghapus data…';
+    stopBtn.style.display = '';
     showAlert('truncateAlertBox', '');
     $('truncateSummary').textContent = '';
 
-    selected.forEach(name => {
-        const row = document.querySelector(`#tableListTruncate .table-row[data-table="${CSS.escape(name)}"] .result`);
-        row.textContent = 'Diproses…';
-        row.className = 'result pending';
-    });
+    const runState = createRunState();
+    runState.controller = new AbortController();
+    const onStop = () => stopRun(runState);
+    stopBtn.addEventListener('click', onStop);
 
     try {
-        const payload = { ...credentials(), tables: selected };
-        const { results } = await postJson(routes.truncate, payload);
+        const { success, failed, cancelled } = await processTablesSequentially(selected, 'tableListTruncate', 'truncateSummary', async (table, rowWrap) => {
+            const payload = { ...credentials(), tables: [table] };
+            const { results } = await postJson(routes.truncate, payload, runState.controller.signal);
+            const r = results[0];
 
-        let success = 0, failed = 0;
-
-        results.forEach(r => {
-            const row = document.querySelector(`#tableListTruncate .table-row[data-table="${CSS.escape(r.table)}"] .result`);
             if (r.status === 'success') {
-                row.textContent = 'Kosong ✓';
-                row.className = 'result success';
-                row.closest('.table-row').querySelector('.count').textContent = '0 baris';
-                success++;
-            } else {
-                row.textContent = 'Gagal';
-                row.className = 'result error';
-                row.title = r.message;
-                failed++;
+                rowWrap.querySelector('.count').textContent = '0 baris';
+                return { ok: true, text: 'Kosong' };
             }
-        });
 
-        $('truncateSummary').textContent = `${success} tabel berhasil dikosongkan${failed ? `, ${failed} gagal` : ''}.`;
+            return { ok: false, message: r.message };
+        }, runState);
+
+        $('truncateSummary').textContent = `${success} tabel berhasil dikosongkan${failed ? `, ${failed} gagal` : ''}${cancelled ? `, ${cancelled} dibatalkan` : ''}.`;
     } catch (err) {
         showAlert('truncateAlertBox', err.message, 'error');
     } finally {
+        stopBtn.removeEventListener('click', onStop);
+        stopBtn.style.display = 'none';
         btn.disabled = false;
         btn.textContent = 'Truncate Tabel Terpilih';
     }
@@ -795,7 +873,7 @@ async function loadTablesForMigrate() {
         if (!state.sourceTables) {
             await runTestConnection();
         }
-        renderCheckList('tableListMigrate', 'chk-migrate', state.sourceTables || [], t => `${t.row_count.toLocaleString('id-ID')} baris`);
+        renderCheckList('tableListMigrate', 'chk-migrate', state.sourceTables || [], t => `${t.row_count.toLocaleString('id-ID')} baris`, 'totalCountMigrate');
         bindRowCheckboxes('tableListMigrate', 'chk-migrate', updateMigrateButtonState);
     } catch (err) {
         showAlert('migrateAlertBox', err.message, 'error');
@@ -817,41 +895,84 @@ $('btnMigrate').addEventListener('click', async () => {
     if (!selected.length) return;
 
     const btn = $('btnMigrate');
+    const stopBtn = $('btnStopMigrate');
     btn.disabled = true;
     btn.textContent = 'Memigrasi…';
+    stopBtn.style.display = '';
     $('migrateSummary').textContent = '';
     showAlert('migrateAlertBox', '');
 
-    selected.forEach(name => {
-        const row = document.querySelector(`#tableListMigrate .table-row[data-table="${CSS.escape(name)}"] .result`);
-        row.textContent = 'Sedang diproses…';
-        row.className = 'result pending';
-    });
+    const truncateFirst = $('chkTruncate').checked;
+    const MIGRATE_CHUNK_SIZE = 1000;
+
+    const runState = createRunState();
+    runState.controller = new AbortController();
+    const onStop = () => stopRun(runState);
+    stopBtn.addEventListener('click', onStop);
 
     try {
-        const payload = { ...credentials(), tables: selected, truncate: $('chkTruncate').checked };
-        const { results } = await postJson(routes.migrate, payload);
+        const { success, failed, cancelled } = await processTablesSequentially(selected, 'tableListMigrate', 'migrateSummary', async (table, rowWrap) => {
+            const totalRows = (state.sourceTables || []).find(t => t.name === table)?.row_count || 0;
+            const resultEl = rowWrap.querySelector('.result');
 
-        let success = 0, failed = 0;
+            let offset = 0;
+            let migrated = 0;
+            let done = false;
+            let isFirstChunk = true;
 
-        results.forEach(r => {
-            const row = document.querySelector(`#tableListMigrate .table-row[data-table="${CSS.escape(r.table)}"] .result`);
-            if (r.status === 'success') {
-                row.textContent = `${r.rows_migrated} baris ✓`;
-                row.className = 'result success';
-                success++;
-            } else {
-                row.textContent = 'Gagal';
-                row.className = 'result error';
-                row.title = r.message;
-                failed++;
+            const progressText = () => totalRows
+                ? `${migrated.toLocaleString('id-ID')} / ${totalRows.toLocaleString('id-ID')} baris…`
+                : `${migrated.toLocaleString('id-ID')} baris…`;
+
+            try {
+                while (!done) {
+                    // Dicek di sini juga (bukan cuma andalkan AbortSignal) supaya begitu
+                    // Stop diklik, chunk BERIKUTNYA tidak usah dikirim sama sekali.
+                    if (runState.stopped) {
+                        const abortErr = new Error('Dihentikan oleh user');
+                        abortErr.name = 'AbortError';
+                        throw abortErr;
+                    }
+
+                    resultEl.textContent = progressText();
+
+                    const payload = {
+                        ...credentials(),
+                        table,
+                        offset,
+                        chunk_size: MIGRATE_CHUNK_SIZE,
+                        truncate: isFirstChunk && truncateFirst,
+                    };
+
+                    const chunk = await postJson(routes.migrateChunk, payload, runState.controller.signal);
+
+                    migrated += chunk.migrated;
+                    offset = chunk.next_offset;
+                    done = chunk.done;
+                    isFirstChunk = false;
+                }
+
+                return { ok: true, text: `${migrated.toLocaleString('id-ID')} baris` };
+            } catch (err) {
+                // migrated tetap kepegang di sini — user tahu persis sampai baris berapa
+                // sebelum gagal/dihentikan, baik karena error maupun klik Stop Proses.
+                const stopped = err.name === 'AbortError';
+
+                return {
+                    ok: false,
+                    stopped,
+                    text: totalRows ? `${migrated.toLocaleString('id-ID')} / ${totalRows.toLocaleString('id-ID')} baris` : `${migrated.toLocaleString('id-ID')} baris`,
+                    message: stopped ? undefined : err.message,
+                };
             }
-        });
+        }, runState);
 
-        $('migrateSummary').textContent = `${success} tabel berhasil${failed ? `, ${failed} gagal` : ''}.`;
+        $('migrateSummary').textContent = `${success} tabel berhasil${failed ? `, ${failed} gagal` : ''}${cancelled ? `, ${cancelled} dibatalkan` : ''}.`;
     } catch (err) {
         showAlert('migrateAlertBox', err.message, 'error');
     } finally {
+        stopBtn.removeEventListener('click', onStop);
+        stopBtn.style.display = 'none';
         btn.disabled = false;
         btn.textContent = 'Mulai Migrasi';
     }

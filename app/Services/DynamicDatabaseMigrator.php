@@ -87,22 +87,21 @@ class DynamicDatabaseMigrator
      * dari INFORMATION_SCHEMA source, jadi tidak perlu tahu struktur tabel
      * di muka. Kolom bertipe `bit` dicast ke boolean untuk Postgres.
      */
-    public function migrateTable(
-        string $sourceSchema,
-        string $table,
-        string $targetSchema,
-        bool $truncate,
-        int $chunkSize = 1000
-    ): array {
+    /**
+     * Ambil daftar nama kolom & kolom bertipe `bit` (buat dicast ke boolean)
+     * dari source. Dipakai bareng oleh migrateTable() dan migrateChunk().
+     */
+    protected function loadColumnMeta(string $schema, string $table): array
+    {
         $columns = DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
             SELECT COLUMN_NAME, DATA_TYPE
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
-        SQL, [$sourceSchema, $table]);
+        SQL, [$schema, $table]);
 
         if (empty($columns)) {
-            throw new RuntimeException("Tabel {$sourceSchema}.{$table} tidak ditemukan di source.");
+            throw new RuntimeException("Tabel {$schema}.{$table} tidak ditemukan di source.");
         }
 
         $columnNames = array_map(fn ($c) => $c->COLUMN_NAME, $columns);
@@ -110,6 +109,35 @@ class DynamicDatabaseMigrator
             fn ($c) => $c->COLUMN_NAME,
             array_filter($columns, fn ($c) => $c->DATA_TYPE === 'bit')
         );
+
+        return [$columnNames, $boolColumns];
+    }
+
+    protected function castRow(array $row, array $columnNames, array $boolColumns): array
+    {
+        $data = [];
+
+        foreach ($columnNames as $column) {
+            $value = $row[$column] ?? null;
+
+            if ($value !== null && in_array($column, $boolColumns, true)) {
+                $value = (bool) $value;
+            }
+
+            $data[$column] = $value;
+        }
+
+        return $data;
+    }
+
+    public function migrateTable(
+        string $sourceSchema,
+        string $table,
+        string $targetSchema,
+        bool $truncate,
+        int $chunkSize = 1000
+    ): array {
+        [$columnNames, $boolColumns] = $this->loadColumnMeta($sourceSchema, $table);
         $orderColumn = $columnNames[0];
 
         $targetTable = "{$targetSchema}.{$table}";
@@ -129,20 +157,7 @@ class DynamicDatabaseMigrator
                 $payload = [];
 
                 foreach ($rows as $row) {
-                    $row = (array) $row;
-                    $data = [];
-
-                    foreach ($columnNames as $column) {
-                        $value = $row[$column] ?? null;
-
-                        if ($value !== null && in_array($column, $boolColumns, true)) {
-                            $value = (bool) $value;
-                        }
-
-                        $data[$column] = $value;
-                    }
-
-                    $payload[] = $data;
+                    $payload[] = $this->castRow((array) $row, $columnNames, $boolColumns);
                 }
 
                 DB::connection(self::TARGET_CONNECTION)->table($targetTable)->insert($payload);
@@ -153,6 +168,64 @@ class DynamicDatabaseMigrator
         $this->resetIdentityIfNeeded($targetSchema, $table);
 
         return ['table' => $table, 'rows_migrated' => $migrated];
+    }
+
+    /**
+     * Migrasi SATU potongan (chunk) tabel, dipanggil berulang oleh client
+     * (offset naik tiap panggilan) supaya progres per baris kelihatan di UI
+     * dan setiap request tetap singkat/aman dari timeout, alih-alih satu
+     * request raksasa untuk seluruh tabel seperti migrateTable().
+     */
+    public function migrateChunk(
+        string $sourceSchema,
+        string $table,
+        string $targetSchema,
+        int $offset,
+        int $chunkSize,
+        bool $truncateFirst
+    ): array {
+        [$columnNames, $boolColumns] = $this->loadColumnMeta($sourceSchema, $table);
+        $orderColumn = $columnNames[0];
+        $targetTable = "{$targetSchema}.{$table}";
+
+        if ($truncateFirst) {
+            DB::connection(self::TARGET_CONNECTION)->statement(
+                "TRUNCATE TABLE \"{$targetSchema}\".\"{$table}\" CASCADE"
+            );
+        }
+
+        $rows = DB::connection(self::SOURCE_CONNECTION)
+            ->table("{$sourceSchema}.{$table}")
+            ->orderBy($orderColumn)
+            ->skip($offset)
+            ->take($chunkSize)
+            ->get();
+
+        $migrated = 0;
+
+        if ($rows->isNotEmpty()) {
+            $payload = [];
+
+            foreach ($rows as $row) {
+                $payload[] = $this->castRow((array) $row, $columnNames, $boolColumns);
+            }
+
+            DB::connection(self::TARGET_CONNECTION)->table($targetTable)->insert($payload);
+            $migrated = count($payload);
+        }
+
+        // Kurang dari chunk size = sudah baris terakhir, tidak perlu request lagi.
+        $done = $migrated < $chunkSize;
+
+        if ($done) {
+            $this->resetIdentityIfNeeded($targetSchema, $table);
+        }
+
+        return [
+            'migrated' => $migrated,
+            'next_offset' => $offset + $migrated,
+            'done' => $done,
+        ];
     }
 
     /**

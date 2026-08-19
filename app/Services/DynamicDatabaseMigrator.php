@@ -160,7 +160,7 @@ class DynamicDatabaseMigrator
                     $payload[] = $this->castRow((array) $row, $columnNames, $boolColumns);
                 }
 
-                DB::connection(self::TARGET_CONNECTION)->table($targetTable)->insert($payload);
+                $this->insertInSafeBatches($targetTable, $payload, count($columnNames));
 
                 $migrated += count($payload);
             });
@@ -168,6 +168,21 @@ class DynamicDatabaseMigrator
         $this->resetIdentityIfNeeded($targetSchema, $table);
 
         return ['table' => $table, 'rows_migrated' => $migrated];
+    }
+
+    /**
+     * PostgreSQL membatasi 1 statement maksimal 65.535 parameter terikat.
+     * Untuk tabel yang sangat lebar (banyak kolom), insert satu batch besar
+     * bisa saja melewati batas itu — jadi dipecah lagi jadi sub-batch yang
+     * aman berdasar jumlah kolomnya.
+     */
+    protected function insertInSafeBatches(string $targetTable, array $payload, int $columnCount): void
+    {
+        $safeBatchSize = max(1, intdiv(60000, max(1, $columnCount)));
+
+        foreach (array_chunk($payload, $safeBatchSize) as $batch) {
+            DB::connection(self::TARGET_CONNECTION)->table($targetTable)->insert($batch);
+        }
     }
 
     /**
@@ -210,7 +225,7 @@ class DynamicDatabaseMigrator
                 $payload[] = $this->castRow((array) $row, $columnNames, $boolColumns);
             }
 
-            DB::connection(self::TARGET_CONNECTION)->table($targetTable)->insert($payload);
+            $this->insertInSafeBatches($targetTable, $payload, count($columnNames));
             $migrated = count($payload);
         }
 
@@ -352,6 +367,10 @@ class DynamicDatabaseMigrator
 
                 $sql = $this->buildCreateTableSql($targetSchema, $table, $columns, $identityColumns, $pkColumns);
 
+                if (str_contains($sql, 'gen_random_uuid()')) {
+                    $this->ensurePgcryptoExtension();
+                }
+
                 DB::connection(self::TARGET_CONNECTION)->statement($sql);
 
                 $results[] = ['table' => $table, 'status' => 'success', 'sql' => $sql];
@@ -366,6 +385,112 @@ class DynamicDatabaseMigrator
         }
 
         return $results;
+    }
+
+    /**
+     * Buat FOREIGN KEY dari source ke tabel-tabel yang diminta. Dipanggil
+     * TERPISAH dari createSchema() (bukan per-tabel) supaya tidak masalah
+     * kalau tabel yang direferensikan kebetulan diproses belakangan dalam
+     * batch yang sama. Idempotent (dilewati kalau constraint dengan nama
+     * sama sudah ada) dan aman kalau tabel referensi belum ada di target
+     * (dilaporkan sebagai "skipped", bukan error yang menghentikan proses).
+     */
+    public function createForeignKeys(string $sourceSchema, array $tables, string $targetSchema): array
+    {
+        $results = [];
+
+        foreach ($tables as $table) {
+            $rows = DB::connection(self::SOURCE_CONNECTION)->select(<<<'SQL'
+                SELECT
+                    fk.name AS fk_name,
+                    pc.name AS parent_column,
+                    tr.name AS ref_table,
+                    rc.name AS ref_column,
+                    fk.delete_referential_action_desc AS on_delete,
+                    fk.update_referential_action_desc AS on_update,
+                    fkc.constraint_column_id AS col_order
+                FROM sys.foreign_keys fk
+                JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+                JOIN sys.tables tp ON fk.parent_object_id = tp.object_id
+                JOIN sys.schemas sch_parent ON tp.schema_id = sch_parent.schema_id
+                JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+                JOIN sys.tables tr ON fk.referenced_object_id = tr.object_id
+                JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+                WHERE sch_parent.name = ? AND tp.name = ?
+                ORDER BY fk.name, fkc.constraint_column_id
+            SQL, [$sourceSchema, $table]);
+
+            if (empty($rows)) {
+                continue;
+            }
+
+            foreach ($this->groupForeignKeyRows($rows) as $fkName => $fk) {
+                $results[] = $this->applyForeignKey($table, $fkName, $fk, $targetSchema);
+            }
+        }
+
+        return $results;
+    }
+
+    protected function groupForeignKeyRows(array $rows): array
+    {
+        $grouped = [];
+
+        foreach ($rows as $row) {
+            $grouped[$row->fk_name]['parent_columns'][] = $row->parent_column;
+            $grouped[$row->fk_name]['ref_columns'][] = $row->ref_column;
+            $grouped[$row->fk_name]['ref_table'] = $row->ref_table;
+            $grouped[$row->fk_name]['on_delete'] = $row->on_delete;
+            $grouped[$row->fk_name]['on_update'] = $row->on_update;
+        }
+
+        return $grouped;
+    }
+
+    protected function applyForeignKey(string $table, string $fkName, array $fk, string $targetSchema): array
+    {
+        $sql = null;
+
+        try {
+            $refTableExists = DB::connection(self::TARGET_CONNECTION)->selectOne(
+                'SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?',
+                [$targetSchema, $fk['ref_table']]
+            );
+
+            if (! $refTableExists) {
+                return [
+                    'table' => $table,
+                    'fk' => $fkName,
+                    'status' => 'skipped',
+                    'message' => "Tabel referensi \"{$targetSchema}\".\"{$fk['ref_table']}\" belum ada di target — buat tabel itu juga lalu ulangi.",
+                ];
+            }
+
+            $alreadyExists = DB::connection(self::TARGET_CONNECTION)->selectOne(
+                'SELECT 1 FROM pg_constraint WHERE conname = ?',
+                [$fkName]
+            );
+
+            if ($alreadyExists) {
+                return ['table' => $table, 'fk' => $fkName, 'status' => 'exists'];
+            }
+
+            $parentCols = implode(', ', array_map(fn ($c) => "\"{$c}\"", $fk['parent_columns']));
+            $refCols = implode(', ', array_map(fn ($c) => "\"{$c}\"", $fk['ref_columns']));
+            $onDelete = str_replace('_', ' ', $fk['on_delete']);
+            $onUpdate = str_replace('_', ' ', $fk['on_update']);
+
+            $sql = "ALTER TABLE \"{$targetSchema}\".\"{$table}\" "
+                ."ADD CONSTRAINT \"{$fkName}\" FOREIGN KEY ({$parentCols}) "
+                ."REFERENCES \"{$targetSchema}\".\"{$fk['ref_table']}\" ({$refCols}) "
+                ."ON DELETE {$onDelete} ON UPDATE {$onUpdate}";
+
+            DB::connection(self::TARGET_CONNECTION)->statement($sql);
+
+            return ['table' => $table, 'fk' => $fkName, 'status' => 'success', 'sql' => $sql];
+        } catch (Throwable $e) {
+            return ['table' => $table, 'fk' => $fkName, 'status' => 'error', 'message' => $e->getMessage(), 'sql' => $sql];
+        }
     }
 
     /**
@@ -387,6 +512,21 @@ class DynamicDatabaseMigrator
         }
 
         return array_map(fn ($r) => $r->ROUTINE_NAME, $rows);
+    }
+
+    /**
+     * gen_random_uuid() (padanan NEWID()) butuh extension pgcrypto. Dicoba
+     * aktifkan otomatis; kalau role target tidak punya izin, dibiarkan lanjut
+     * — CREATE TABLE-nya nanti akan gagal dengan pesan jelas soal fungsi
+     * tidak ditemukan, bukan gagal diam-diam.
+     */
+    protected function ensurePgcryptoExtension(): void
+    {
+        try {
+            DB::connection(self::TARGET_CONNECTION)->statement('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+        } catch (Throwable) {
+            // sengaja dibiarkan lanjut, lihat docblock di atas
+        }
     }
 
     protected function buildCreateTableSql(
@@ -463,9 +603,23 @@ class DynamicDatabaseMigrator
     }
 
     /**
-     * Hanya menerjemahkan default literal (angka/string/0-1 bit). Default
-     * berupa ekspresi/fungsi T-SQL (GETDATE(), NEWID(), dst) dilewati —
+     * Fungsi T-SQL umum yang punya padanan AMAN & jelas di Postgres. Di luar
+     * daftar ini (ekspresi kompleks, fungsi custom) sengaja tetap dilewati —
      * lebih aman tidak ada default daripada default yang salah semantik.
+     */
+    protected const FUNCTION_DEFAULT_MAP = [
+        'getdate()' => 'CURRENT_TIMESTAMP',
+        'getutcdate()' => "(now() at time zone 'utc')",
+        'sysdatetime()' => 'CURRENT_TIMESTAMP',
+        'sysutcdatetime()' => "(now() at time zone 'utc')",
+        'newid()' => 'gen_random_uuid()',
+        'suser_sname()' => 'current_user',
+    ];
+
+    /**
+     * Menerjemahkan default literal (angka/string/0-1 bit) dan sejumlah
+     * fungsi T-SQL umum (lihat FUNCTION_DEFAULT_MAP). Default berupa
+     * ekspresi/fungsi lain di luar daftar itu tetap dilewati.
      */
     protected function translateDefault(?string $sqlServerDefault, string $pgType): ?string
     {
@@ -477,6 +631,10 @@ class DynamicDatabaseMigrator
 
         while (str_starts_with($value, '(') && str_ends_with($value, ')')) {
             $value = trim(substr($value, 1, -1));
+        }
+
+        if (isset(self::FUNCTION_DEFAULT_MAP[strtolower($value)])) {
+            return self::FUNCTION_DEFAULT_MAP[strtolower($value)];
         }
 
         if (preg_match('/^-?\d+(\.\d+)?$/', $value)) {

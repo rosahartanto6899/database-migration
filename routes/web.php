@@ -12,6 +12,7 @@ Route::prefix('migration')->name('migration.')->group(function () {
     Route::post('/test-connection', [MigrationToolController::class, 'testConnection'])->name('test-connection');
     Route::post('/create-database', [MigrationToolController::class, 'createDatabase'])->name('create-database');
     Route::post('/create-schema', [MigrationToolController::class, 'createSchema'])->name('create-schema');
+    Route::post('/create-foreign-keys', [MigrationToolController::class, 'createForeignKeys'])->name('create-foreign-keys');
     Route::post('/target-tables', [MigrationToolController::class, 'targetTables'])->name('target-tables');
     Route::post('/truncate', [MigrationToolController::class, 'truncate'])->name('truncate');
     Route::post('/migrate', [MigrationToolController::class, 'migrate'])->name('migrate');

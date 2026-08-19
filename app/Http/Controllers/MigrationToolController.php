@@ -118,6 +118,31 @@ class MigrationToolController extends Controller
         }
     }
 
+    /**
+     * Dipanggil terpisah dari createSchema(), sekali untuk seluruh tabel
+     * terpilih (bukan per-tabel), supaya urutan tabel yang dicentang tidak
+     * memengaruhi apakah tabel yang direferensikan sudah ada atau belum.
+     */
+    public function createForeignKeys(Request $request): JsonResponse
+    {
+        $data = $this->validateCredentials($request);
+
+        $validated = $request->validate([
+            'tables' => 'required|array|min:1',
+            'tables.*' => 'required|string',
+        ]);
+
+        $migrator = new DynamicDatabaseMigrator($data['source'], $data['target']);
+
+        try {
+            $results = $migrator->createForeignKeys($data['source']['schema'], $validated['tables'], $data['target']['schema']);
+
+            return response()->json(['results' => $results]);
+        } catch (Throwable $e) {
+            return response()->json(['message' => $this->cleanErrorMessage($e)], 422);
+        }
+    }
+
     public function targetTables(Request $request): JsonResponse
     {
         $data = $this->validateCredentials($request);
@@ -249,7 +274,18 @@ class MigrationToolController extends Controller
 
     protected function cleanErrorMessage(Throwable $e): string
     {
-        // Ambil baris pertama saja supaya pesan driver PDO yang panjang tetap ringkas di UI.
-        return trim(strtok($e->getMessage(), "\n")) ?: $e->getMessage();
+        $message = $e->getMessage();
+
+        // Illuminate\Database\QueryException selalu menempel " (Connection: ..., SQL: ...)"
+        // di akhir pesan — dan bagian SQL itu berisi query LENGKAP dengan seluruh value
+        // yang di-insert (bisa ratusan karakter untuk insert banyak baris/kolom). Buang
+        // bagian ini supaya yang tampil ke user cuma alasan errornya, bukan datanya.
+        $cutAt = strpos($message, ' (Connection: ');
+        if ($cutAt !== false) {
+            $message = substr($message, 0, $cutAt);
+        }
+
+        // Ambil baris pertama saja buat jaga-jaga kalau masih ada pesan multi-baris lain.
+        return trim(strtok($message, "\n")) ?: $message;
     }
 }
